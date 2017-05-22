@@ -875,7 +875,7 @@ return cmsgpack.pack(result)
                                      % (job.uuid, reason))
 
     @base.check_who
-    def claim(self, job, who, expiry=None):
+    def claim(self, job, who, expiry=10):
         if expiry is None:
             # On the lua side none doesn't translate to nil so we have
             # do to this string conversion to make sure that we can tell
