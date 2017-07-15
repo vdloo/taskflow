@@ -16,11 +16,13 @@
 
 import contextlib
 
+from mock import Mock
 from zake import fake_client
 
 from taskflow.jobs import backends
 from taskflow.jobs.backends import impl_redis
 from taskflow.jobs.backends import impl_zookeeper
+from taskflow.jobs.backends import impl_consul
 from taskflow import test
 
 
@@ -60,3 +62,27 @@ class BackendFetchingTest(test.TestCase):
         }
         with contextlib.closing(backends.fetch('test', conf)) as be:
             self.assertIsInstance(be, impl_redis.RedisJobBoard)
+
+    def test_consul_entry_point_text(self):
+        conf = 'consul'
+        with contextlib.closing(backends.fetch('test', conf)) as be:
+            self.assertIsInstance(be, impl_consul.ConsulJobBoard)
+
+    def test_consul_entry_point(self):
+        conf = {
+            'board': 'consul',
+        }
+        with contextlib.closing(backends.fetch('test', conf)) as be:
+            self.assertIsInstance(be, impl_consul.ConsulJobBoard)
+
+    def test_consul_entry_point_existing_client(self):
+        existing_client = Mock()
+        conf = {
+            'board': 'consul',
+        }
+        kwargs = {
+            'client': existing_client,
+        }
+        with contextlib.closing(backends.fetch('test', conf, **kwargs)) as be:
+            self.assertIsInstance(be, impl_consul.ConsulJobBoard)
+            self.assertIs(existing_client, be._client)

@@ -21,6 +21,7 @@ import time
 
 from oslo_utils import timeutils
 import redis
+import consul_kv
 import six
 
 from taskflow import exceptions
@@ -31,6 +32,7 @@ from taskflow import task
 from taskflow.types import failure
 from taskflow.utils import kazoo_utils
 from taskflow.utils import redis_utils
+from taskflow.utils import consul_utils
 
 ARGS_KEY = '__args__'
 KWARGS_KEY = '__kwargs__'
@@ -87,6 +89,11 @@ def redis_available(min_version):
         ok, redis_version = redis_utils.is_server_new_enough(client,
                                                              min_version)
         return ok
+
+
+def consul_available(min_version):
+    client = consul_kv.Connection()
+    return consul_utils.is_server_new_enough(client, min_version)
 
 
 class NoopRetry(retry.AlwaysRevert):

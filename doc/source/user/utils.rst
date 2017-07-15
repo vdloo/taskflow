@@ -18,6 +18,11 @@ Banner
 
 .. automodule:: taskflow.utils.banner
 
+Consul
+~~~~~~
+
+.. automodule:: taskflow.utils.consul_utils
+
 Eventlet
 ~~~~~~~~
 
