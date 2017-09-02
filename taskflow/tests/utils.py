@@ -93,7 +93,9 @@ def redis_available(min_version):
 
 def consul_available(min_version):
     client = consul_kv.Connection()
-    return consul_utils.is_server_new_enough(client, min_version)
+    ok, consul_version = consul_utils.is_server_new_enough(client,
+                                                           min_version)
+    return ok
 
 
 class NoopRetry(retry.AlwaysRevert):
