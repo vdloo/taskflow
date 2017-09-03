@@ -25,7 +25,6 @@ from taskflow import states
 from taskflow import test
 from taskflow.tests.unit.jobs import base
 from taskflow.tests import utils as test_utils
-from taskflow.tests.utils import CONSUL_TEST_ENDPOINT
 from taskflow.utils import persistence_utils as p_utils
 
 
@@ -40,9 +39,9 @@ class ConsulJobboardTest(test.TestCase, base.BoardTestMixin):
 
     def create_board(self, persistence=None):
         namespace = uuidutils.generate_uuid()
-        client = consul_kv.Connection(endpoint=CONSUL_TEST_ENDPOINT)
+        client = consul_kv.Connection()
         config = {
-            'namespace': six.b("taskflow-{}" % namespace),
+            'namespace': six.b("taskflow-%s" % namespace),
         }
         kwargs = {
             'client': client,

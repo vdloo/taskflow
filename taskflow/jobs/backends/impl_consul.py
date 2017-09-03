@@ -17,6 +17,9 @@
 import contextlib
 import datetime
 import functools
+from http.client import CONFLICT
+from urllib.error import HTTPError
+
 import six
 import time
 import consul_kv
@@ -49,7 +52,7 @@ def _translate_failures():
 class ConsulJob(base.Job):
     """A consul job."""
 
-    def __init__(self, board, name, key,
+    def __init__(self, board, name, key, path,
                  uuid=None, details=None,
                  created_on=None, backend=None,
                  book=None, book_data=None,
@@ -59,6 +62,7 @@ class ConsulJob(base.Job):
                                        backend=backend,
                                        book=book, book_data=book_data)
         self._created_on = created_on
+        self._path = path
         self._client = board._client
         self._consul_version = board._consul_version
         self._key = key
@@ -72,6 +76,11 @@ class ConsulJob(base.Job):
     @property
     def priority(self):
         return self._priority
+
+    @property
+    def path(self):
+        """Path the job key value data is stored."""
+        return self._path
 
     @property
     def last_modified_key(self):
@@ -119,18 +128,12 @@ class ConsulJob(base.Job):
     def __lt__(self, other):
         if not isinstance(other, ConsulJob):
             return NotImplemented
-        if self.board.listings_key == other.board.listings_key:
-            if self.priority == other.priority:
-                return self.sequence < other.sequence
-            else:
-                ordered = base.JobPriority.reorder(
-                    (self.priority, self), (other.priority, other))
-                if ordered[0] is self:
-                    return False
-                return True
         else:
-            # Different jobboards with different listing keys...
-            return self.board.listings_key < other.board.listings_key
+            ordered = base.JobPriority.reorder(
+                (self.priority, self), (other.priority, other))
+            if ordered[0] is self:
+                return False
+            return True
 
     def __eq__(self, other):
         if not isinstance(other, ConsulJob):
@@ -245,6 +248,9 @@ class ConsulJobBoard(base.JobBoard):
 
     #: Postfix (combined with job key) used to make a jobs owner key.
     OWNED_POSTFIX = ".owned"
+
+    #: Postfix that lock entries have.
+    LOCK_POSTFIX = ".lock"
 
     #: Postfix (combined with job key) used to make a jobs last modified key.
     LAST_MODIFIED_POSTFIX = ".last_modified"
@@ -365,8 +371,18 @@ class ConsulJobBoard(base.JobBoard):
             return raw_owner
 
     def _put_key_value(self, key, value):
+        """
+        Raises HTTPError if any of the keys already exist
+        """
         self._client.put_dict(
-            {self.DEFAULT_NAMESPACE: {key: value}}
+            {self.DEFAULT_NAMESPACE: {key: value}},
+            verb='cas'
+        )
+
+    def _delete_key(self, key):
+        self._client.delete(
+            join(self.DEFAULT_NAMESPACE, key),
+            recurse=True
         )
 
     def post(self, name, book=None, details=None,
@@ -380,10 +396,12 @@ class ConsulJobBoard(base.JobBoard):
                                       created_on=timeutils.utcnow(),
                                       book=book, details=details,
                                       priority=job_priority)
-        with _translate_failures():
-            self._put_key_value(join(self.JOB_PREFIX, 'job0000000001'), posting)
 
-            return ConsulJob(self, name, job_uuid,
+        path = join(self.JOB_PREFIX, job_uuid)
+        with _translate_failures():
+            self._put_key_value(path, posting)
+
+            return ConsulJob(self, name, job_uuid, path=path,
                              uuid=job_uuid, details=details,
                              created_on=posting['created_on'],
                              book=book, book_data=posting.get('book'),
@@ -423,8 +441,9 @@ class ConsulJobBoard(base.JobBoard):
 
     def _fetch_jobs(self):
         with _translate_failures():
+            base_path = "{}/{}".format(self.DEFAULT_NAMESPACE, self.JOB_PREFIX)
             serialized_postings = self._client.get_dict(
-                "{}/{}".format(self.DEFAULT_NAMESPACE, self.JOB_PREFIX)
+                base_path
             )[self.DEFAULT_NAMESPACE][self.JOB_PREFIX]
         postings = []
         for job_key, serialized_posting in six.iteritems(serialized_postings):
@@ -445,7 +464,8 @@ class ConsulJobBoard(base.JobBoard):
                                 job_key, exc_info=True)
             else:
                 postings.append(ConsulJob(self, job_name,
-                                          job_key, uuid=job_uuid,
+                                          job_key, path=join(base_path, job_key),
+                                          uuid=job_uuid,
                                           details=job_details,
                                           created_on=job_created_on,
                                           book_data=serialized_posting.get('book'),
@@ -465,124 +485,47 @@ class ConsulJobBoard(base.JobBoard):
 
     @base.check_who
     def consume(self, job, who):
-        script = self._get_script('consume')
-        with _translate_failures():
-            raw_who = who
-            raw_result = script(keys=[job.owner_key, self.listings_key,
-                                      job.last_modified_key],
-                                args=[raw_who, job.key])
-            result = self._loads(raw_result)
-        status = result['status']
-        if status != self.SCRIPT_STATUS_OK:
-            reason = result.get('reason')
-            if reason == self.SCRIPT_UNKNOWN_JOB:
-                raise exc.NotFound("Job %s not found to be"
-                                   " consumed" % (job.uuid))
-            elif reason == self.SCRIPT_UNKNOWN_OWNER:
-                raise exc.NotFound("Can not consume job %s"
-                                   " which we can not determine"
-                                   " the owner of" % (job.uuid))
-            elif reason == self.SCRIPT_NOT_EXPECTED_OWNER:
-                raw_owner = result.get('owner')
-                if raw_owner:
-                    owner = raw_owner
-                    raise exc.JobFailure("Can not consume job %s"
-                                         " which is not owned by %s (it is"
-                                         " actively owned by %s)"
-                                         % (job.uuid, who, owner))
-                else:
-                    raise exc.JobFailure("Can not consume job %s"
-                                         " which is not owned by %s"
-                                         % (job.uuid, who))
-            else:
-                raise exc.JobFailure("Failure to consume job %s,"
-                                     " unknown internal error (reason=%s)"
-                                     % (job.uuid, reason))
+        try:
+            with _translate_failures():
+                self._delete_key(join(job.path + self.LOCK_POSTFIX))
+                self._delete_key(join(job.path))
+        except:
+            raise exc.JobFailure("Failure to consume job %s,"
+                                 " unknown internal error (reason=%s)"
+                                 % (job.uuid, 'uncaught'))
 
     @base.check_who
     def claim(self, job, who, expiry=None):
         if expiry is None:
-            # On the lua side none doesn't translate to nil so we have
-            # do to this string conversion to make sure that we can tell
-            # the difference.
-            ms_expiry = "none"
+            ms_expiry = None
         else:
             ms_expiry = int(expiry * 1000.0)
             if ms_expiry <= 0:
                 raise ValueError("Provided expiry (when converted to"
                                  " milliseconds) must be greater"
                                  " than zero instead of %s" % (expiry))
-        script = self._get_script('claim')
-        with _translate_failures():
-            raw_who = who
-            raw_result = script(keys=[job.owner_key, self.listings_key,
-                                      job.last_modified_key],
-                                args=[raw_who, job.key,
-                                      # NOTE(harlowja): we need to send this
-                                      # in as a blob (even if it's not
-                                      # set/used), since the format can not
-                                      # currently be created in lua...
-                                      self._dumps(timeutils.utcnow()),
-                                      ms_expiry])
-            result = self._loads(raw_result)
-        status = result['status']
-        if status != self.SCRIPT_STATUS_OK:
-            reason = result.get('reason')
-            if reason == self.SCRIPT_UNKNOWN_JOB:
-                raise exc.NotFound("Job %s not found to be"
-                                   " claimed" % (job.uuid))
-            elif reason == self.SCRIPT_ALREADY_CLAIMED:
-                raw_owner = result.get('owner')
-                if raw_owner:
-                    owner = raw_owner
-                    raise exc.UnclaimableJob("Job %s already"
-                                             " claimed by %s"
-                                             % (job.uuid, owner))
-                else:
-                    raise exc.UnclaimableJob("Job %s already"
-                                             " claimed" % (job.uuid))
+        value = {'owner': who, 'pexpire': ms_expiry}
+        try:
+            with _translate_failures():
+                self._put_key_value(join(job.path + self.LOCK_POSTFIX), value)
+        except HTTPError as e:
+            if e.code == CONFLICT:
+                raise exc.UnclaimableJob("Job %s already"
+                                         " claimed" % (job.uuid))
             else:
-                raise exc.JobFailure("Failure to claim job %s,"
-                                     " unknown internal error (reason=%s)"
-                                     % (job.uuid, reason))
+                raise
 
     @base.check_who
     def abandon(self, job, who):
-        script = self._get_script('abandon')
-        with _translate_failures():
-            raw_who = who
-            raw_result = script(keys=[job.owner_key, self.listings_key,
-                                      job.last_modified_key],
-                                args=[raw_who, job.key,
-                                      self._dumps(timeutils.utcnow())])
-            result = self._loads(raw_result)
-        status = result.get('status')
-        if status != self.SCRIPT_STATUS_OK:
-            reason = result.get('reason')
-            if reason == self.SCRIPT_UNKNOWN_JOB:
-                raise exc.NotFound("Job %s not found to be"
-                                   " abandoned" % (job.uuid))
-            elif reason == self.SCRIPT_UNKNOWN_OWNER:
-                raise exc.NotFound("Can not abandon job %s"
-                                   " which we can not determine"
-                                   " the owner of" % (job.uuid))
-            elif reason == self.SCRIPT_NOT_EXPECTED_OWNER:
-                raw_owner = result.get('owner')
-                if raw_owner:
-                    owner = raw_owner
-                    raise exc.JobFailure("Can not abandon job %s"
-                                         " which is not owned by %s (it is"
-                                         " actively owned by %s)"
-                                         % (job.uuid, who, owner))
-                else:
-                    raise exc.JobFailure("Can not abandon job %s"
-                                         " which is not owned by %s"
-                                         % (job.uuid, who))
-            else:
-                raise exc.JobFailure("Failure to abandon job %s,"
-                                     " unknown internal"
-                                     " error (status=%s, reason=%s)"
-                                     % (job.uuid, status, reason))
+        try:
+            with _translate_failures():
+                self._delete_key(join(job.path + self.LOCK_POSTFIX))
+                self._delete_key(join(job.path))
+        except:
+            raise exc.JobFailure("Failure to abandon job %s,"
+                                 " unknown internal"
+                                 " error (status=%s, reason=%s)"
+                                 % (job.uuid, 'unknown', 'uncaught'))
 
     def _get_script(self, name):
         try:
@@ -594,37 +537,10 @@ class ConsulJobBoard(base.JobBoard):
 
     @base.check_who
     def trash(self, job, who):
-        script = self._get_script('trash')
-        with _translate_failures():
-            raw_who = who
-            raw_result = script(keys=[job.owner_key, self.listings_key,
-                                      job.last_modified_key, self.trash_key],
-                                args=[raw_who, job.key,
-                                      self._dumps(timeutils.utcnow())])
-            result = self._loads(raw_result)
-        status = result['status']
-        if status != self.SCRIPT_STATUS_OK:
-            reason = result.get('reason')
-            if reason == self.SCRIPT_UNKNOWN_JOB:
-                raise exc.NotFound("Job %s not found to be"
-                                   " trashed" % (job.uuid))
-            elif reason == self.SCRIPT_UNKNOWN_OWNER:
-                raise exc.NotFound("Can not trash job %s"
-                                   " which we can not determine"
-                                   " the owner of" % (job.uuid))
-            elif reason == self.SCRIPT_NOT_EXPECTED_OWNER:
-                raw_owner = result.get('owner')
-                if raw_owner:
-                    owner = raw_owner
-                    raise exc.JobFailure("Can not trash job %s"
-                                         " which is not owned by %s (it is"
-                                         " actively owned by %s)"
-                                         % (job.uuid, who, owner))
-                else:
-                    raise exc.JobFailure("Can not trash job %s"
-                                         " which is not owned by %s"
-                                         % (job.uuid, who))
-            else:
-                raise exc.JobFailure("Failure to trash job %s,"
-                                     " unknown internal error (reason=%s)"
-                                     % (job.uuid, reason))
+        try:
+            with _translate_failures():
+                self._delete_key(join(job.path))
+        except:
+            raise exc.JobFailure("Failure to trash job %s,"
+                                 " unknown internal error (reason=%s)"
+                                 % (job.uuid, 'unknown'))
