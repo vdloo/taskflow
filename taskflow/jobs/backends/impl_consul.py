@@ -41,6 +41,13 @@ from taskflow.utils import consul_utils as cu
 
 LOG = logging.getLogger(__name__)
 
+#: Key **prefix** that job entries have.
+JOB_PREFIX = 'job'
+
+#: Postfix that lock entries have.
+LOCK_POSTFIX = ".lock"
+
+
 
 @contextlib.contextmanager
 def _translate_failures():
@@ -168,39 +175,16 @@ class ConsulJob(base.Job):
 
     @property
     def state(self):
-        listings_key = self._board.listings_key
-        owner_key = self._owner_key
-        listings_sub_key = self._key
-
-        def _do_fetch(p):
-            # NOTE(harlowja): state of a job in consul is not set into any
-            # explicit 'state' field, but is maintained by what nodes exist in
-            # consul instead (ie if a owner key exists, then we know a owner
-            # is active, if no job data exists and no owner, then we know that
-            # the job is unclaimed, and so-on)...
-            p.multi()
-            p.hexists(listings_key, listings_sub_key)
-            p.exists(owner_key)
-            job_exists, owner_exists = p.execute()
-            if not job_exists:
-                if owner_exists:
-                    # This should **not** be possible due to lua code ordering
-                    # but let's log an INFO statement if it does happen (so
-                    # that it can be investigated)...
-                    LOG.info("Unexpected owner key found at '%s' when job"
-                             " key '%s[%s]' was not found", owner_key,
-                             listings_key, listings_sub_key)
-                return states.COMPLETE
-            else:
-                if owner_exists:
-                    return states.CLAIMED
-                else:
-                    return states.UNCLAIMED
-
         with _translate_failures():
-            return self._client.transaction(_do_fetch,
-                                            listings_key, owner_key,
-                                            value_from_callable=True)
+            try:
+                job_data = self._client.get_dict(self.path)
+                try:
+                    lock_data = self._client.get_dict(join(self.path, LOCK_POSTFIX))
+                    return states.CLAIMED
+                except:
+                    return states.UNCLAIMED
+            except:
+                return states.COMPLETE
 
 
 class ConsulJobBoard(base.JobBoard):
@@ -249,17 +233,11 @@ class ConsulJobBoard(base.JobBoard):
     #: Postfix (combined with job key) used to make a jobs owner key.
     OWNED_POSTFIX = ".owned"
 
-    #: Postfix that lock entries have.
-    LOCK_POSTFIX = ".lock"
-
     #: Postfix (combined with job key) used to make a jobs last modified key.
     LAST_MODIFIED_POSTFIX = ".last_modified"
 
     #: Default namespace for keys when none is provided.
     DEFAULT_NAMESPACE = 'taskflow'
-
-    #: Key **prefix** that job entries have.
-    JOB_PREFIX = 'job'
 
     #: Transaction support was added in 0.7.0 so we need at least that version.
     MIN_CONSUL_VERSION = (0, 7, 0)
@@ -397,7 +375,7 @@ class ConsulJobBoard(base.JobBoard):
                                       book=book, details=details,
                                       priority=job_priority)
 
-        path = join(self.JOB_PREFIX, job_uuid)
+        path = join(JOB_PREFIX, job_uuid)
         with _translate_failures():
             self._put_key_value(path, posting)
 
@@ -441,10 +419,10 @@ class ConsulJobBoard(base.JobBoard):
 
     def _fetch_jobs(self):
         with _translate_failures():
-            base_path = "{}/{}".format(self.DEFAULT_NAMESPACE, self.JOB_PREFIX)
+            base_path = "{}/{}".format(self.DEFAULT_NAMESPACE, JOB_PREFIX)
             serialized_postings = self._client.get_dict(
                 base_path
-            )[self.DEFAULT_NAMESPACE][self.JOB_PREFIX]
+            )[self.DEFAULT_NAMESPACE][JOB_PREFIX]
         postings = []
         for job_key, serialized_posting in six.iteritems(serialized_postings):
             try:
@@ -460,7 +438,7 @@ class ConsulJobBoard(base.JobBoard):
             except (ValueError, TypeError, KeyError):
                 with excutils.save_and_reraise_exception():
                     LOG.warning("Incorrectly formatted job data found at"
-                                " key: %s[%s]", self.JOB_PREFIX,
+                                " key: %s[%s]", JOB_PREFIX,
                                 job_key, exc_info=True)
             else:
                 postings.append(ConsulJob(self, job_name,
@@ -487,7 +465,7 @@ class ConsulJobBoard(base.JobBoard):
     def consume(self, job, who):
         try:
             with _translate_failures():
-                self._delete_key(join(job.path + self.LOCK_POSTFIX))
+                self._delete_key(join(job.path + LOCK_POSTFIX))
                 self._delete_key(join(job.path))
         except:
             raise exc.JobFailure("Failure to consume job %s,"
@@ -507,7 +485,7 @@ class ConsulJobBoard(base.JobBoard):
         value = {'owner': who, 'pexpire': ms_expiry}
         try:
             with _translate_failures():
-                self._put_key_value(join(job.path + self.LOCK_POSTFIX), value)
+                self._put_key_value(join(job.path + LOCK_POSTFIX), value)
         except HTTPError as e:
             if e.code == CONFLICT:
                 raise exc.UnclaimableJob("Job %s already"
@@ -519,7 +497,7 @@ class ConsulJobBoard(base.JobBoard):
     def abandon(self, job, who):
         try:
             with _translate_failures():
-                self._delete_key(join(job.path + self.LOCK_POSTFIX))
+                self._delete_key(join(job.path + LOCK_POSTFIX))
                 self._delete_key(join(job.path))
         except:
             raise exc.JobFailure("Failure to abandon job %s,"
